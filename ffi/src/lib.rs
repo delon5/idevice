@@ -92,8 +92,20 @@ use tokio::runtime::{self, Runtime};
 #[cfg(unix)]
 use crate::util::{idevice_sockaddr, idevice_socklen_t};
 
+// Was new_multi_thread() for both runtimes - Tokio's own default
+// multi-threaded runtime internally spawns one worker OS thread per
+// CPU core, with no explicit thread-priority configuration in this
+// code at all. A real, direct kernel sandbox log confirmed the
+// Helper's own extension process (more restricted than the main app)
+// was hit with "deny(1) system-sched self" - exactly the kind of
+// thread-scheduling operation this default spawning behavior could
+// trigger. Switching to new_current_thread() avoids spawning any
+// additional OS-level worker threads at all - I/O and timers remain
+// fully supported, tasks are still genuinely concurrent, just
+// interleaved on a single thread rather than running across multiple
+// threads in true parallel.
 static GLOBAL_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
-    runtime::Builder::new_multi_thread()
+    runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
         .build()
@@ -101,7 +113,7 @@ static GLOBAL_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
 });
 
 static LOCAL_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
-    runtime::Builder::new_multi_thread()
+    runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
