@@ -119,6 +119,23 @@ static LOCAL_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
         .unwrap()
 });
 
+// Guards LOCAL_RUNTIME.block_on() so only one OS thread is ever inside
+// it at a time. LOCAL_RUNTIME is a single, shared, `current_thread`
+// tokio Runtime, and run_sync_local() below is the call site nearly
+// every FFI function in this crate goes through (heartbeat,
+// mobile_image_mounter, lockdown, dvt, afc, ...) — each individually
+// invokable from its own, independent thread/queue on the C side, with
+// nothing here previously preventing two of them from calling
+// block_on() on this one shared Runtime at the same moment. A
+// `current_thread` runtime's block_on isn't safe to enter concurrently
+// from multiple threads on the same Runtime instance — confirmed as
+// the cause of an intermittent, silent hang inside image mounter calls
+// specifically when a concurrently-running heartbeat call landed on
+// the same Runtime at the same time. Ordinary mutual exclusion here
+// means a second caller just waits its turn on a plain, well-understood
+// mutex instead of colliding inside tokio's own runtime internals.
+static LOCAL_RUNTIME_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Spawn the future on the global runtime and block current (FFI) thread until result.
 /// F and R must be Send + 'static.
 pub fn run_sync<F, R>(fut: F) -> R
@@ -142,6 +159,7 @@ where
     F: std::future::Future<Output = R>,
     R: 'static,
 {
+    let _guard = LOCAL_RUNTIME_GUARD.lock().unwrap();
     LOCAL_RUNTIME.block_on(fut)
 }
 
