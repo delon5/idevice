@@ -125,18 +125,32 @@ use crate::util::{idevice_sockaddr, idevice_socklen_t};
 // entirely intact - the concern was Tokio's default of one worker per
 // CPU core, roughly sixteen threads on this hardware. This spawns two
 // in total while restoring correct behaviour.
+// RAISED 1 -> 8 - see
+// fix_idevice_runtime_worker_threads_v2.py's docstring. Every debug
+// proxy operation goes through run_sync(), which spawns onto THIS
+// runtime: send_command, read_response, send_raw, read, send_ack.
+// Sixteen concurrent runDebugService loops mediate every JIT W^X
+// page-protection toggle through those calls, so a single worker
+// thread serialised all of them. Measured result: 228 legitimate
+// 0xf00d toggle requests, of which 24 took over a second, median
+// 6.6s, worst 41.2s - JIT enabled, then throttled far below
+// interpreter speed.
 static GLOBAL_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     runtime::Builder::new_multi_thread()
-        .worker_threads(1)
+        .worker_threads(8)
         .enable_io()
         .enable_time()
         .build()
         .unwrap()
 });
 
+// RAISED 1 -> 2. This runtime only carries run_sync_local() work -
+// tunnel creation, DDI mount, connect - which is occasional and
+// bursty during attach rather than sustained. Two is ample; the
+// contention measured on device was entirely on GLOBAL_RUNTIME.
 static LOCAL_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     runtime::Builder::new_multi_thread()
-        .worker_threads(1)
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap()
