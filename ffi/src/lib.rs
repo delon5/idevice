@@ -104,8 +104,30 @@ use crate::util::{idevice_sockaddr, idevice_socklen_t};
 // fully supported, tasks are still genuinely concurrent, just
 // interleaved on a single thread rather than running across multiple
 // threads in true parallel.
+// CORRECTED - see fix_idevice_runtime_worker_threads.py's docstring.
+// The new_current_thread() change above was fatal for GLOBAL_RUNTIME:
+// a current_thread runtime has no worker threads and advances only
+// while a thread is inside block_on. run_sync() below SPAWNS onto
+// GLOBAL_RUNTIME and then blocks on rx.recv(), and nothing anywhere
+// calls block_on on GLOBAL_RUNTIME - so every spawned task was queued
+// and never polled, and all ~45 run_sync call sites in this crate
+// hung permanently on first use. Measured on device: state=WAITING,
+// cpu_usage=0/1000, CPU time identical to the microsecond across
+// probes 30s apart.
+//
+// LOCAL_RUNTIME needs workers too, for a second reason: sockets are
+// created on it via run_sync_local, so their readiness registration
+// belongs to its I/O driver. As current_thread that driver is dormant
+// unless someone is in block_on, so a write polled from elsewhere
+// would wait on a driver nobody is running.
+//
+// worker_threads(1) keeps the original sandbox mitigation almost
+// entirely intact - the concern was Tokio's default of one worker per
+// CPU core, roughly sixteen threads on this hardware. This spawns two
+// in total while restoring correct behaviour.
 static GLOBAL_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
-    runtime::Builder::new_current_thread()
+    runtime::Builder::new_multi_thread()
+        .worker_threads(1)
         .enable_io()
         .enable_time()
         .build()
@@ -113,7 +135,8 @@ static GLOBAL_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
 });
 
 static LOCAL_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
-    runtime::Builder::new_current_thread()
+    runtime::Builder::new_multi_thread()
+        .worker_threads(1)
         .enable_all()
         .build()
         .unwrap()
