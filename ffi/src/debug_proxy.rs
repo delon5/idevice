@@ -241,7 +241,18 @@ pub unsafe extern "C" fn debug_proxy_send_command(
         },
     };
 
-    let res = run_sync(async move { client.send_command(cmd).await });
+    // CHANGED - cancellable, so debug_proxy_cancel can release a loop
+    // blocked here. A cancelled call surfaces as FfiInvalidArg, which
+    // sendDebugCommand already reports as DebugCommandSendFailed and
+    // the debug loop treats as "command failed" and exits cleanly -
+    // exactly the desired outcome. See
+    // fix_debug_proxy_cancellation.py.
+    let res = match crate::run_sync_cancellable(handle as usize, async move {
+        client.send_command(cmd).await
+    }) {
+        Some(r) => r,
+        None => return ffi_err!(IdeviceError::FfiInvalidArg),
+    };
 
     match res {
         Ok(Some(r)) => {
@@ -282,7 +293,15 @@ pub unsafe extern "C" fn debug_proxy_read_response(
     }
 
     let client = unsafe { &mut (*handle).0 };
-    let res = run_sync(async move { client.read_response().await });
+    // CHANGED - cancellable for the same reason as send_command above.
+    // This one matters for the batched region preparation, which
+    // issues one raw write and then blocks here once per page.
+    let res = match crate::run_sync_cancellable(handle as usize, async move {
+        client.read_response().await
+    }) {
+        Some(r) => r,
+        None => return ffi_err!(IdeviceError::FfiInvalidArg),
+    };
 
     match res {
         Ok(Some(r)) => {
@@ -456,6 +475,33 @@ pub unsafe extern "C" fn debug_proxy_send_ack(
         Ok(_) => null_mut(),
         Err(e) => ffi_err!(e),
     }
+}
+
+/// Aborts any in-flight call on this debug proxy, releasing the thread
+/// blocked inside it.
+///
+/// Exists because runDebugService only checks its detach flag between
+/// iterations - a loop blocked inside a continue command never reaches
+/// the check, and on device fourteen sessions asked to detach while
+/// only one actually did, the rest staying blocked for an entire
+/// eleven-minute suspension. See fix_debug_proxy_cancellation.py.
+///
+/// The cancelled call returns an error to its caller, which the debug
+/// loop already handles by exiting cleanly.
+///
+/// # Safety
+/// `handle` must be a valid pointer to a handle allocated by this
+/// library, or NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn debug_proxy_cancel(
+    handle: *mut DebugProxyHandle,
+) -> *mut IdeviceFfiError {
+    if handle.is_null() {
+        return ffi_err!(IdeviceError::FfiInvalidArg);
+    }
+
+    crate::cancel_in_flight(handle as usize);
+    null_mut()
 }
 
 /// Sends a NACK to the debug proxy

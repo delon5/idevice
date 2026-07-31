@@ -191,6 +191,77 @@ where
     rx.recv().expect("runtime worker panicked")
 }
 
+// ADDED - see fix_debug_proxy_cancellation.py's docstring.
+//
+// Tracks the JoinHandle of an in-flight run_sync_cancellable call so a
+// later FFI call can abort it. Keyed by the caller's own handle
+// pointer rather than stored on the handle itself: every debug proxy
+// call borrows straight through DebugProxyHandle and hands that borrow
+// to a 'static future, so a field on the struct would be touched from
+// two threads while one holds a mutable borrow. A side table avoids
+// that entirely and needs no change to the struct or its construction
+// sites.
+//
+// One in-flight call per key is assumed, which holds - runDebugService
+// issues its commands sequentially on one thread per session.
+static IN_FLIGHT_CALLS: Lazy<std::sync::Mutex<std::collections::HashMap<usize, tokio::task::JoinHandle<()>>>> =
+    Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Like run_sync, but the spawned task is registered under `key` so
+/// cancel_in_flight(key) can abort it, and a cancelled call returns
+/// None rather than panicking.
+///
+/// That last part is the whole reason this exists separately. run_sync
+/// ends with `rx.recv().expect(...)`, and an aborted task drops its tx
+/// without sending - so recv() returns Err and expect() panics. A Rust
+/// panic unwinding across an FFI boundary is undefined behaviour, so
+/// aborting a run_sync task would crash rather than unblock. run_sync
+/// is deliberately left untouched so its other call sites across the
+/// crate are unaffected.
+pub fn run_sync_cancellable<F, R>(key: usize, fut: F) -> Option<R>
+where
+    F: std::future::Future<Output = R> + Send + 'static,
+    R: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+
+    let join = GLOBAL_RUNTIME.handle().spawn(async move {
+        let res = fut.await;
+        // best-effort send; ignore if receiver dropped
+        let _ = tx.send(res);
+    });
+
+    if let Ok(mut in_flight) = IN_FLIGHT_CALLS.lock() {
+        in_flight.insert(key, join);
+    }
+
+    // Err here means the sender was dropped without sending, i.e. the
+    // task was aborted. Deliberately not a panic.
+    let result = rx.recv().ok();
+
+    if let Ok(mut in_flight) = IN_FLIGHT_CALLS.lock() {
+        in_flight.remove(&key);
+    }
+
+    result
+}
+
+/// Aborts whatever run_sync_cancellable call is registered under
+/// `key`, if any. Returns whether something was actually aborted.
+pub fn cancel_in_flight(key: usize) -> bool {
+    let Ok(mut in_flight) = IN_FLIGHT_CALLS.lock() else {
+        return false;
+    };
+
+    match in_flight.remove(&key) {
+        Some(join) => {
+            join.abort();
+            true
+        }
+        None => false,
+    }
+}
+
 pub fn run_sync_local<F, R>(fut: F) -> R
 where
     F: std::future::Future<Output = R>,
